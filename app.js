@@ -3,7 +3,10 @@
 /* ============================================================
    Student Money Manager — app.js
    Modules: Storage, Transactions, Calculations, UI
+   Backend: AWS API Gateway -> Lambda -> DynamoDB
    ============================================================ */
+
+const API_BASE_URL = 'https://laj0xqlm0k.execute-api.us-east-2.amazonaws.com';
 
 const CATEGORIES = [
   { name: 'Food', icon: '🍔' },
@@ -48,47 +51,46 @@ function formatDate(isoDate) {
 }
 
 /* ----------------------- Storage module ----------------------- */
+/* Thin wrapper around the AWS API (API Gateway -> Lambda -> DynamoDB). */
 const Storage = (() => {
-  const TX_KEY = 'smm.transactions';
-  const BUDGET_KEY = 'smm.budget';
-
-  function loadTransactions() {
-    try {
-      const raw = localStorage.getItem(TX_KEY);
-      const parsed = raw ? JSON.parse(raw) : [];
-      return Array.isArray(parsed) ? parsed : [];
-    } catch (e) {
-      console.error('Failed to load transactions', e);
-      return [];
+  async function request(path, options = {}) {
+    const res = await fetch(`${API_BASE_URL}${path}`, {
+      headers: { 'Content-Type': 'application/json' },
+      ...options,
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.message || `Request failed (${res.status})`);
     }
+    return res.json();
   }
 
-  function saveTransactions(transactions) {
-    localStorage.setItem(TX_KEY, JSON.stringify(transactions));
+  function loadTransactions() {
+    return request('/transactions');
+  }
+
+  function createTransaction(txn) {
+    return request('/transactions', { method: 'POST', body: JSON.stringify(txn) });
+  }
+
+  function removeTransaction(id) {
+    return request(`/transactions/${encodeURIComponent(id)}`, { method: 'DELETE' });
   }
 
   function loadBudget() {
-    try {
-      const raw = localStorage.getItem(BUDGET_KEY);
-      const parsed = raw ? JSON.parse(raw) : null;
-      if (parsed && typeof parsed.monthlyLimit === 'number') return parsed;
-      return { monthlyLimit: 0 };
-    } catch (e) {
-      console.error('Failed to load budget', e);
-      return { monthlyLimit: 0 };
-    }
+    return request('/budget');
   }
 
   function saveBudget(budget) {
-    localStorage.setItem(BUDGET_KEY, JSON.stringify(budget));
+    return request('/budget', { method: 'PUT', body: JSON.stringify(budget) });
   }
 
-  return { loadTransactions, saveTransactions, loadBudget, saveBudget };
+  return { loadTransactions, createTransaction, removeTransaction, loadBudget, saveBudget };
 })();
 
 /* --------------------- Transactions module --------------------- */
 const Transactions = (() => {
-  let cache = Storage.loadTransactions();
+  let cache = [];
 
   function sortAll(list) {
     return [...list].sort((a, b) => {
@@ -97,11 +99,15 @@ const Transactions = (() => {
     });
   }
 
+  async function init() {
+    cache = await Storage.loadTransactions();
+  }
+
   function getAll() {
     return sortAll(cache);
   }
 
-  function addTransaction(data) {
+  async function addTransaction(data) {
     const txn = {
       id: generateId(),
       type: data.type,
@@ -111,25 +117,26 @@ const Transactions = (() => {
       date: data.date,
       createdAt: new Date().toISOString(),
     };
+    await Storage.createTransaction(txn);
     cache.push(txn);
-    Storage.saveTransactions(cache);
     return txn;
   }
 
-  function deleteTransaction(id) {
+  async function deleteTransaction(id) {
     const idx = cache.findIndex(t => t.id === id);
     if (idx === -1) return null;
-    const [removed] = cache.splice(idx, 1);
-    Storage.saveTransactions(cache);
-    return removed;
+    const txn = cache[idx];
+    await Storage.removeTransaction(id);
+    cache.splice(idx, 1);
+    return txn;
   }
 
-  function restoreTransaction(txn) {
+  async function restoreTransaction(txn) {
+    await Storage.createTransaction(txn);
     cache.push(txn);
-    Storage.saveTransactions(cache);
   }
 
-  return { getAll, addTransaction, deleteTransaction, restoreTransaction };
+  return { init, getAll, addTransaction, deleteTransaction, restoreTransaction };
 })();
 
 /* -------------------- Calculations module ---------------------- */
@@ -186,7 +193,7 @@ const Calculations = (() => {
 const UI = (() => {
   const els = {};
   let lastDeleted = null;
-  let undoTimer = null;
+  let currentBudget = { monthlyLimit: 0 };
 
   function cacheEls() {
     els.form = document.getElementById('txn-form');
@@ -301,8 +308,7 @@ const UI = (() => {
     const balance = Calculations.getBalance(all);
     const monthIncome = Calculations.getMonthlyIncome(all);
     const monthExpense = Calculations.getMonthlyExpenses(all);
-    const budget = Storage.loadBudget();
-    const usage = Calculations.getBudgetUsage(monthExpense, budget);
+    const usage = Calculations.getBudgetUsage(monthExpense, currentBudget);
 
     els.balance.textContent = formatMoney(balance);
     els.balance.classList.toggle('negative', balance < 0);
@@ -331,10 +337,9 @@ const UI = (() => {
   }
 
   function renderBudgetSection() {
-    const budget = Storage.loadBudget();
-    if (budget && budget.monthlyLimit > 0) {
-      els.budgetCurrent.textContent = `Current budget: ${formatMoney(budget.monthlyLimit)} / month`;
-      els.budgetInput.value = budget.monthlyLimit;
+    if (currentBudget && currentBudget.monthlyLimit > 0) {
+      els.budgetCurrent.textContent = `Current budget: ${formatMoney(currentBudget.monthlyLimit)} / month`;
+      els.budgetInput.value = currentBudget.monthlyLimit;
     } else {
       els.budgetCurrent.textContent = 'No budget configured yet.';
       els.budgetInput.value = '';
@@ -461,7 +466,7 @@ const UI = (() => {
       els.descCount.textContent = `${els.description.value.length}/200`;
     });
 
-    els.form.addEventListener('submit', e => {
+    els.form.addEventListener('submit', async e => {
       e.preventDefault();
       clearFieldErrors();
 
@@ -483,27 +488,39 @@ const UI = (() => {
 
       Object.entries(warnings).forEach(([field, msg]) => setFieldWarning(field, msg));
 
-      Transactions.addTransaction({
-        type: input.type,
-        amount: Number(input.amount),
-        category: input.category,
-        date: input.date,
-        description: input.description,
-      });
+      const submitBtn = els.form.querySelector('.btn-primary');
+      submitBtn.disabled = true;
+      submitBtn.textContent = 'Adding…';
 
-      els.form.reset();
-      els.date.value = todayISO();
-      els.descCount.textContent = '0/200';
-      setActiveType(input.type);
+      try {
+        await Transactions.addTransaction({
+          type: input.type,
+          amount: Number(input.amount),
+          category: input.category,
+          date: input.date,
+          description: input.description,
+        });
 
-      refreshAll();
-      showToast(
-        `${input.type === 'income' ? 'Income' : 'Expense'} of ${formatMoney(Number(input.amount))} added.`,
-        { type: 'success' }
-      );
+        els.form.reset();
+        els.date.value = todayISO();
+        els.descCount.textContent = '0/200';
+        setActiveType(input.type);
+
+        refreshAll();
+        showToast(
+          `${input.type === 'income' ? 'Income' : 'Expense'} of ${formatMoney(Number(input.amount))} added.`,
+          { type: 'success' }
+        );
+      } catch (err) {
+        console.error(err);
+        showToast('Could not save transaction. Check your connection and try again.', { type: 'error' });
+      } finally {
+        submitBtn.disabled = false;
+        submitBtn.textContent = 'Add Transaction';
+      }
     });
 
-    els.budgetForm.addEventListener('submit', e => {
+    els.budgetForm.addEventListener('submit', async e => {
       e.preventDefault();
       const raw = els.budgetInput.value.trim();
       const errEl = els.budgetForm.querySelector('.field-error[data-for="monthlyLimit"]');
@@ -518,49 +535,85 @@ const UI = (() => {
         return;
       }
 
-      Storage.saveBudget({ monthlyLimit: round2(num) });
-      refreshAll();
-      showToast('Monthly budget saved.', { type: 'success' });
+      const submitBtn = els.budgetForm.querySelector('.btn-secondary');
+      submitBtn.disabled = true;
+      submitBtn.textContent = 'Saving…';
+
+      try {
+        currentBudget = await Storage.saveBudget({ monthlyLimit: round2(num) });
+        refreshAll();
+        showToast('Monthly budget saved.', { type: 'success' });
+      } catch (err) {
+        console.error(err);
+        showToast('Could not save budget. Check your connection and try again.', { type: 'error' });
+      } finally {
+        submitBtn.disabled = false;
+        submitBtn.textContent = 'Save Budget';
+      }
     });
 
-    els.txList.addEventListener('click', e => {
+    els.txList.addEventListener('click', async e => {
       const btn = e.target.closest('.delete-btn');
       if (!btn) return;
       const id = btn.dataset.id;
       const row = btn.closest('.txn-row');
+      btn.disabled = true;
 
-      const removed = Transactions.deleteTransaction(id);
-      if (!removed) return;
-      lastDeleted = removed;
+      try {
+        const removed = await Transactions.deleteTransaction(id);
+        if (!removed) return;
+        lastDeleted = removed;
 
-      if (row) {
-        row.classList.add('removing');
+        if (row) row.classList.add('removing');
+        refreshAll();
+
+        showToast('Transaction deleted.', {
+          type: 'info',
+          actionLabel: 'Undo',
+          onAction: async () => {
+            if (lastDeleted) {
+              try {
+                await Transactions.restoreTransaction(lastDeleted);
+                lastDeleted = null;
+                refreshAll();
+                showToast('Transaction restored.', { type: 'success' });
+              } catch (err) {
+                console.error(err);
+                showToast('Could not restore transaction.', { type: 'error' });
+              }
+            }
+          },
+        });
+      } catch (err) {
+        console.error(err);
+        showToast('Could not delete transaction. Check your connection and try again.', { type: 'error' });
+        btn.disabled = false;
       }
-      refreshAll();
-
-      showToast('Transaction deleted.', {
-        type: 'info',
-        actionLabel: 'Undo',
-        onAction: () => {
-          if (lastDeleted) {
-            Transactions.restoreTransaction(lastDeleted);
-            lastDeleted = null;
-            refreshAll();
-            showToast('Transaction restored.', { type: 'success' });
-          }
-        },
-      });
     });
   }
 
-  function init() {
+  async function init() {
     cacheEls();
     populateCategories();
     setActiveType('expense');
     els.date.value = todayISO();
-    els.date.max = '';
     bindEvents();
-    refreshAll();
+
+    els.txEmpty.hidden = true;
+    els.txList.innerHTML = '<p class="empty-note">Loading your transactions…</p>';
+
+    try {
+      const [budget] = await Promise.all([Storage.loadBudget(), Transactions.init()]);
+      currentBudget = budget;
+      refreshAll();
+    } catch (err) {
+      console.error(err);
+      els.txList.innerHTML = '';
+      showToast('Could not load your data from the server. Check your connection and API URL.', {
+        type: 'error',
+        duration: 8000,
+      });
+    }
   }
 
   return { init };
