@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Student Money Manager</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>💸</text></svg>" />
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="bg-decor" aria-hidden="true"></div>
+
+  <div id="toast-region" class="toast-region" aria-live="polite"></div>
+
+  <div class="app-shell">
+    <header class="app-header">
+      <div class="brand">
+        <span class="brand-mark">💸</span>
+        <div class="brand-text">
+          <h1>Student Money Manager</h1>
+          <p>Track spending, hit your budget, stress less.</p>
+        </div>
+      </div>
+    </header>
+
+    <section class="stats-grid" aria-label="Financial summary">
+      <div class="stat-card stat-balance-card">
+        <span class="stat-label">Current Balance</span>
+        <span class="stat-value" id="stat-balance">$0.00</span>
+        <span class="stat-sub">All time · income minus expenses</span>
+      </div>
+
+      <div class="stat-card">
+        <span class="stat-label">Income This Month</span>
+        <span class="stat-value income" id="stat-income">$0.00</span>
+        <span class="stat-sub">Current calendar month</span>
+      </div>
+
+      <div class="stat-card">
+        <span class="stat-label">Expenses This Month</span>
+        <span class="stat-value expense" id="stat-expense">$0.00</span>
+        <span class="stat-sub">Current calendar month</span>
+      </div>
+
+      <div class="stat-card budget-card">
+        <span class="stat-label">Budget Usage</span>
+        <span class="stat-value" id="stat-budget-value">No budget set</span>
+        <div class="stat-progress-track">
+          <div class="stat-progress-fill" id="stat-budget-bar"></div>
+        </div>
+        <span class="stat-sub" id="stat-budget-label">Set a budget below</span>
+      </div>
+    </section>
+
+    <main class="main-grid">
+      <section class="panel form-panel" aria-labelledby="add-txn-heading">
+        <h2 id="add-txn-heading">Add a Transaction</h2>
+
+        <form id="txn-form" novalidate>
+          <div class="field">
+            <span class="field-label">Type</span>
+            <div id="type-toggle" class="seg-toggle" role="tablist" aria-label="Transaction type">
+              <button type="button" class="seg-btn" data-type="income" role="tab">⬆️ Income</button>
+              <button type="button" class="seg-btn" data-type="expense" role="tab">⬇️ Expense</button>
+            </div>
+          </div>
+
+          <div class="field">
+            <label class="field-label" for="field-amount">Amount</label>
+            <div class="input-with-prefix">
+              <span class="input-prefix">$</span>
+              <input type="number" id="field-amount" name="amount" step="0.01" min="0" placeholder="0.00" inputmode="decimal" />
+            </div>
+            <p class="field-error" data-for="amount"></p>
+          </div>
+
+          <div class="field">
+            <label class="field-label" for="field-category">Category</label>
+            <select id="field-category" name="category"></select>
+            <p class="field-error" data-for="category"></p>
+          </div>
+
+          <div class="field">
+            <label class="field-label" for="field-date">Date</label>
+            <input type="date" id="field-date" name="date" />
+            <p class="field-error" data-for="date"></p>
+            <p class="field-warning" data-for="date"></p>
+          </div>
+
+          <div class="field">
+            <div class="field-label-row">
+              <label class="field-label" for="field-description">Description <span class="optional">(optional)</span></label>
+              <span class="char-count" id="desc-count">0/200</span>
+            </div>
+            <input type="text" id="field-description" name="description" maxlength="200" placeholder="e.g., Chipotle with roommates" />
+            <p class="field-error" data-for="description"></p>
+          </div>
+
+          <button type="submit" class="btn-primary">Add Transaction</button>
+        </form>
+      </section>
+
+      <div class="side-stack">
+        <section class="panel budget-panel" aria-labelledby="budget-heading">
+          <h2 id="budget-heading">Monthly Budget</h2>
+          <p class="budget-current" id="budget-current">No budget configured yet.</p>
+          <form id="budget-form" novalidate>
+            <div class="field">
+              <label class="field-label" for="field-budget">Monthly expense limit</label>
+              <div class="input-with-prefix">
+                <span class="input-prefix">$</span>
+                <input type="number" id="field-budget" name="monthlyLimit" step="0.01" min="0" placeholder="e.g., 500" inputmode="decimal" />
+              </div>
+              <p class="field-error" data-for="monthlyLimit"></p>
+            </div>
+            <button type="submit" class="btn-secondary">Save Budget</button>
+          </form>
+        </section>
+
+        <section class="panel chart-panel" aria-labelledby="chart-heading">
+          <h2 id="chart-heading">Spending by Category</h2>
+          <p class="panel-sub">This month's expenses</p>
+          <div id="category-chart" class="category-chart"></div>
+          <p id="category-empty" class="empty-note">No expenses recorded this month yet.</p>
+        </section>
+      </div>
+
+      <section class="panel history-panel" aria-labelledby="history-heading">
+        <div class="history-header">
+          <h2 id="history-heading">Transaction History</h2>
+          <span class="txn-count" id="txn-count">0 transactions</span>
+        </div>
+
+        <div class="txn-table" role="table">
+          <div class="txn-row txn-row-head" role="row" aria-hidden="true">
+            <div class="txn-cell">Category</div>
+            <div class="txn-cell">Date</div>
+            <div class="txn-cell">Type</div>
+            <div class="txn-cell">Amount</div>
+            <div class="txn-cell"></div>
+          </div>
+          <div id="txn-list"></div>
+        </div>
+
+        <div id="txn-empty" class="empty-state" hidden>
+          <span class="empty-emoji">🧾</span>
+          <p>No transactions yet. Add your first one above!</p>
+        </div>
+      </section>
+    </main>
+
+    <footer class="app-footer">
+      <p>Your data stays on this device — stored locally in your browser.</p>
+    </footer>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
