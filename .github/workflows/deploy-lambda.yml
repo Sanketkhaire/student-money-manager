@@ -43,7 +43,7 @@ jobs:
           npm ci --omit=dev
           zip -qr ../../function.zip index.mjs handler.mjs validation.mjs package.json node_modules
 
-      - uses: aws-actions/configure-aws-credentials@v4
+      - uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: us-east-2
