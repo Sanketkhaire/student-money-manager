@@ -672,6 +672,70 @@ select.has-error {
 
 .toast-close:hover { color: var(--text-hi); }
 
+/* -------------------- Auth -------------------- */
+.app-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.auth-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.auth-bar[hidden] { display: none; }
+
+.user-email {
+  color: var(--text-mid);
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 240px;
+}
+
+.btn-ghost {
+  border: 1px solid var(--panel-border);
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text-hi);
+  font-size: 13px;
+  font-weight: 600;
+  padding: 8px 14px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.btn-ghost:hover { background: rgba(255, 255, 255, 0.1); border-color: var(--panel-border-hover); }
+
+.gate-panel {
+  max-width: 460px;
+  margin: 48px auto;
+  text-align: center;
+}
+
+.gate-panel[hidden] { display: none; }
+
+.gate-emoji {
+  display: block;
+  font-size: 40px;
+  margin-bottom: 8px;
+}
+
+.gate-text {
+  color: var(--text-mid);
+  font-size: 14px;
+  line-height: 1.55;
+  margin: 0 0 20px;
+}
+
+.gate-btn[hidden] { display: none; }
+
 /* -------------------- Footer -------------------- */
 .app-footer {
   margin-top: 36px;

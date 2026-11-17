@@ -29,6 +29,13 @@ sharing, no accounts.
 - Should run as a single static page (or a small set of static files) with no build step
   required, to keep it approachable for an intro software engineering class.
 
+### 1.5 Architecture change (supersedes 1.3/1.4 where they conflict)
+The deployed app no longer uses `localStorage`. Data is stored per user in AWS
+(Cognito sign-in → API Gateway with a JWT authorizer → Lambda → DynamoDB). Users must sign in, and
+each user can only access their own records. `id` and `createdAt` are assigned by the server.
+Infrastructure is defined in `aws/template.yaml`; see `aws/README.md` and `checklist.md`.
+Sections 2.4 and FR-10 describe the original `localStorage` design and are kept for history.
+
 ---
 
 ## 2. Data Model
@@ -254,3 +261,13 @@ to be read end-to-end by a student new to software engineering.
 - Charts/graphs of spending by category.
 - Export to CSV.
 - Multiple budget periods (weekly, semester-based).
+
+---
+
+## 9. Security Checklist (mandatory)
+
+Before any major change, check it against all 10 sections of [checklist.md](checklist.md).
+A change is major if it touches the Lambda/API, the data model, HTML rendering, hosting/headers,
+IAM/CORS, dependencies, the deploy pipeline, or privacy text. In the summary of the change,
+say which sections apply and how each is satisfied. All testing must include the checklist's
+**Test** items.

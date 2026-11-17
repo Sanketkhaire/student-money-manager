@@ -1,0 +1,57 @@
+name: Deploy Lambda
+
+# Deploys aws/lambda to AWS from git (no console copy-paste), so deployed code == repo (checklist §10).
+# Requires repository variables AWS_DEPLOY_ROLE_ARN and LAMBDA_FUNCTION_NAME
+# (CloudFormation outputs GitHubDeployRoleArn / LambdaFunctionName). See aws/README.md.
+
+on:
+  push:
+    branches: [master]
+    paths: ['aws/lambda/**']
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: deploy-lambda
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: ${{ vars.AWS_DEPLOY_ROLE_ARN != '' && vars.LAMBDA_FUNCTION_NAME != '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Test
+        working-directory: aws/lambda
+        run: |
+          npm ci
+          npm test
+          npm audit --audit-level=high
+
+      - name: Build package (production dependencies only)
+        working-directory: aws/lambda
+        run: |
+          rm -rf node_modules
+          npm ci --omit=dev
+          zip -qr ../../function.zip index.mjs handler.mjs validation.mjs package.json node_modules
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: us-east-2
+
+      - name: Deploy
+        run: |
+          aws lambda update-function-code \
+            --function-name "${{ vars.LAMBDA_FUNCTION_NAME }}" \
+            --zip-file fileb://function.zip \
+            --publish
+          aws lambda wait function-updated --function-name "${{ vars.LAMBDA_FUNCTION_NAME }}"

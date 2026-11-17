@@ -3,10 +3,18 @@
 /* ============================================================
    Student Money Manager — app.js
    Modules: Storage, Transactions, Calculations, UI
-   Backend: AWS API Gateway -> Lambda -> DynamoDB
+   Backend: AWS API Gateway (Cognito JWT) -> Lambda -> DynamoDB
+
+   Security notes (see checklist.md):
+   - Data from the server is NEVER inserted as an HTML string. All dynamic
+     content is built with createElement/textContent (§3).
+   - Server records are shape-checked before use, so one malformed record
+     can't break rendering for the rest (§4).
+   - Every API call carries the user's Cognito access token (§1).
    ============================================================ */
 
-const API_BASE_URL = 'https://laj0xqlm0k.execute-api.us-east-2.amazonaws.com';
+const CONFIG = window.SMM_CONFIG || {};
+const MAX_PAGES = 50;
 
 const CATEGORIES = [
   { name: 'Food', icon: '🍔' },
@@ -20,13 +28,12 @@ const CATEGORIES = [
   { name: 'Other', icon: '🗂️' },
 ];
 
-const CATEGORY_ICON = Object.fromEntries(CATEGORIES.map(c => [c.name, c.icon]));
+const CATEGORY_ICON = new Map(CATEGORIES.map(c => [c.name, c.icon]));
+const TYPES = ['income', 'expense'];
+const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
-function generateId() {
-  if (window.crypto && typeof window.crypto.randomUUID === 'function') {
-    return window.crypto.randomUUID();
-  }
-  return `txn-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+function iconFor(category) {
+  return CATEGORY_ICON.get(category) || '🗂️';
 }
 
 function todayISO() {
@@ -45,28 +52,67 @@ function formatMoney(n) {
 }
 
 function formatDate(isoDate) {
+  if (typeof isoDate !== 'string' || !ISO_DATE_RE.test(isoDate)) return '—';
   const [y, m, d] = isoDate.split('-').map(Number);
   const dt = new Date(y, m - 1, d);
   return dt.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
 }
 
+/** Defensive shape check on records coming back from the server. */
+function isWellFormedTxn(t) {
+  return t !== null && typeof t === 'object'
+    && typeof t.id === 'string'
+    && TYPES.includes(t.type)
+    && typeof t.amount === 'number' && Number.isFinite(t.amount) && t.amount > 0
+    && typeof t.category === 'string'
+    && typeof t.date === 'string' && ISO_DATE_RE.test(t.date)
+    && (t.description === undefined || typeof t.description === 'string');
+}
+
+function el(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+
+class AuthError extends Error {}
+
 /* ----------------------- Storage module ----------------------- */
 /* Thin wrapper around the AWS API (API Gateway -> Lambda -> DynamoDB). */
 const Storage = (() => {
   async function request(path, options = {}) {
-    const res = await fetch(`${API_BASE_URL}${path}`, {
-      headers: { 'Content-Type': 'application/json' },
+    const token = Auth.getAccessToken();
+    if (!token) throw new AuthError('Not signed in.');
+
+    const res = await fetch(`${CONFIG.apiBaseUrl}${path}`, {
       ...options,
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      credentials: 'omit',
+      cache: 'no-store',
     });
+    if (res.status === 401) {
+      Auth.clearSession();
+      throw new AuthError('Your session has expired.');
+    }
     if (!res.ok) {
       const body = await res.json().catch(() => ({}));
-      throw new Error(body.message || `Request failed (${res.status})`);
+      throw new Error(typeof body.message === 'string' ? body.message : `Request failed (${res.status})`);
     }
     return res.json();
   }
 
-  function loadTransactions() {
-    return request('/transactions');
+  async function loadTransactions() {
+    const all = [];
+    let cursor = null;
+    for (let page = 0; page < MAX_PAGES; page++) {
+      const qs = cursor ? `?cursor=${encodeURIComponent(cursor)}` : '';
+      const data = await request(`/transactions${qs}`);
+      if (Array.isArray(data.items)) all.push(...data.items);
+      cursor = typeof data.nextCursor === 'string' ? data.nextCursor : null;
+      if (!cursor) break;
+    }
+    return all;
   }
 
   function createTransaction(txn) {
@@ -95,31 +141,33 @@ const Transactions = (() => {
   function sortAll(list) {
     return [...list].sort((a, b) => {
       if (a.date !== b.date) return a.date < b.date ? 1 : -1;
-      return a.createdAt < b.createdAt ? 1 : -1;
+      return String(a.createdAt) < String(b.createdAt) ? 1 : -1;
     });
   }
 
   async function init() {
-    cache = await Storage.loadTransactions();
+    const items = await Storage.loadTransactions();
+    cache = items.filter(isWellFormedTxn);
+    const skipped = items.length - cache.length;
+    if (skipped > 0) console.warn(`Skipped ${skipped} malformed transaction record(s).`);
   }
 
   function getAll() {
     return sortAll(cache);
   }
 
+  // id and createdAt are assigned by the server.
   async function addTransaction(data) {
-    const txn = {
-      id: generateId(),
+    const saved = await Storage.createTransaction({
       type: data.type,
       amount: round2(data.amount),
       category: data.category,
       description: (data.description || '').trim(),
       date: data.date,
-      createdAt: new Date().toISOString(),
-    };
-    await Storage.createTransaction(txn);
-    cache.push(txn);
-    return txn;
+    });
+    if (!isWellFormedTxn(saved)) throw new Error('Unexpected response from server.');
+    cache.push(saved);
+    return saved;
   }
 
   async function deleteTransaction(id) {
@@ -131,9 +179,9 @@ const Transactions = (() => {
     return txn;
   }
 
-  async function restoreTransaction(txn) {
-    await Storage.createTransaction(txn);
-    cache.push(txn);
+  // Undo re-creates the transaction (the server issues a fresh id).
+  function restoreTransaction(txn) {
+    return addTransaction(txn);
   }
 
   return { init, getAll, addTransaction, deleteTransaction, restoreTransaction };
@@ -142,6 +190,7 @@ const Transactions = (() => {
 /* -------------------- Calculations module ---------------------- */
 const Calculations = (() => {
   function isCurrentMonth(isoDate, ref = new Date()) {
+    if (typeof isoDate !== 'string' || !ISO_DATE_RE.test(isoDate)) return false;
     const [y, m] = isoDate.split('-').map(Number);
     return y === ref.getFullYear() && m === ref.getMonth() + 1;
   }
@@ -196,6 +245,15 @@ const UI = (() => {
   let currentBudget = { monthlyLimit: 0 };
 
   function cacheEls() {
+    els.appContent = document.getElementById('app-content');
+    els.gate = document.getElementById('auth-gate');
+    els.gateTitle = document.getElementById('gate-title');
+    els.gateText = document.getElementById('gate-text');
+    els.signinBtn = document.getElementById('signin-btn');
+    els.authBar = document.getElementById('auth-bar');
+    els.userEmail = document.getElementById('user-email');
+    els.signoutBtn = document.getElementById('signout-btn');
+
     els.form = document.getElementById('txn-form');
     els.typeToggle = document.getElementById('type-toggle');
     els.amount = document.getElementById('field-amount');
@@ -225,9 +283,42 @@ const UI = (() => {
     els.toasts = document.getElementById('toast-region');
   }
 
+  function showGate(title, text, { showSignIn }) {
+    els.appContent.hidden = true;
+    els.authBar.hidden = true;
+    els.gate.hidden = false;
+    els.gateTitle.textContent = title;
+    els.gateText.textContent = text;
+    els.signinBtn.hidden = !showSignIn;
+  }
+
+  function showApp() {
+    els.gate.hidden = true;
+    els.appContent.hidden = false;
+    els.authBar.hidden = false;
+    els.userEmail.textContent = Auth.getUserEmail();
+  }
+
+  function showSignedOut(reason) {
+    showGate(
+      'Sign in to continue',
+      reason || 'Your transactions are private to your account. Sign in or create an account to get started.',
+      { showSignIn: true }
+    );
+  }
+
   function populateCategories() {
-    els.category.innerHTML = '<option value="" disabled selected>Choose a category…</option>' +
-      CATEGORIES.map(c => `<option value="${c.name}">${c.icon} ${c.name}</option>`).join('');
+    els.category.replaceChildren();
+    const placeholder = el('option', '', 'Choose a category…');
+    placeholder.value = '';
+    placeholder.disabled = true;
+    placeholder.selected = true;
+    els.category.appendChild(placeholder);
+    CATEGORIES.forEach(c => {
+      const opt = el('option', '', `${c.icon} ${c.name}`);
+      opt.value = c.name;
+      els.category.appendChild(opt);
+    });
   }
 
   function setActiveType(type) {
@@ -243,13 +334,16 @@ const UI = (() => {
     return els.form.dataset.type || 'expense';
   }
 
+  const FIELD_NAMES = ['type', 'amount', 'category', 'date', 'description'];
+
   function clearFieldErrors() {
-    els.form.querySelectorAll('.field-error').forEach(el => (el.textContent = ''));
-    els.form.querySelectorAll('.field-warning').forEach(el => (el.textContent = ''));
-    els.form.querySelectorAll('.has-error').forEach(el => el.classList.remove('has-error'));
+    els.form.querySelectorAll('.field-error').forEach(n => (n.textContent = ''));
+    els.form.querySelectorAll('.field-warning').forEach(n => (n.textContent = ''));
+    els.form.querySelectorAll('.has-error').forEach(n => n.classList.remove('has-error'));
   }
 
   function setFieldError(fieldName, message) {
+    if (!FIELD_NAMES.includes(fieldName)) return;
     const errEl = els.form.querySelector(`.field-error[data-for="${fieldName}"]`);
     const inputEl = els.form.querySelector(`[name="${fieldName}"]`);
     if (errEl) errEl.textContent = message;
@@ -257,24 +351,19 @@ const UI = (() => {
   }
 
   function setFieldWarning(fieldName, message) {
+    if (!FIELD_NAMES.includes(fieldName)) return;
     const warnEl = els.form.querySelector(`.field-warning[data-for="${fieldName}"]`);
     if (warnEl) warnEl.textContent = message;
   }
 
   function showToast(message, opts = {}) {
     const { type = 'success', actionLabel, onAction, duration = 4200 } = opts;
-    const toast = document.createElement('div');
-    toast.className = `toast toast-${type}`;
-    const text = document.createElement('span');
-    text.className = 'toast-text';
-    text.textContent = message;
-    toast.appendChild(text);
+    const toast = el('div', `toast toast-${type}`);
+    toast.appendChild(el('span', 'toast-text', message));
 
     if (actionLabel && onAction) {
-      const btn = document.createElement('button');
-      btn.className = 'toast-action';
+      const btn = el('button', 'toast-action', actionLabel);
       btn.type = 'button';
-      btn.textContent = actionLabel;
       btn.addEventListener('click', () => {
         onAction();
         dismiss();
@@ -282,18 +371,16 @@ const UI = (() => {
       toast.appendChild(btn);
     }
 
-    const closeBtn = document.createElement('button');
-    closeBtn.className = 'toast-close';
+    const closeBtn = el('button', 'toast-close', '✕');
     closeBtn.type = 'button';
     closeBtn.setAttribute('aria-label', 'Dismiss');
-    closeBtn.textContent = '✕';
     closeBtn.addEventListener('click', () => dismiss());
     toast.appendChild(closeBtn);
 
     els.toasts.appendChild(toast);
     requestAnimationFrame(() => toast.classList.add('show'));
 
-    let timer = setTimeout(dismiss, duration);
+    const timer = setTimeout(dismiss, duration);
 
     function dismiss() {
       clearTimeout(timer);
@@ -301,6 +388,15 @@ const UI = (() => {
       toast.classList.add('hide');
       setTimeout(() => toast.remove(), 250);
     }
+  }
+
+  function handleApiError(err, fallbackMessage) {
+    console.error(err);
+    if (err instanceof AuthError) {
+      showSignedOut('Your session has expired. Please sign in again.');
+      return;
+    }
+    showToast(fallbackMessage, { type: 'error' });
   }
 
   function renderStats() {
@@ -348,7 +444,7 @@ const UI = (() => {
 
   function renderCategoryChart(all) {
     const breakdown = Calculations.getCategoryBreakdown(all);
-    els.chart.innerHTML = '';
+    els.chart.replaceChildren();
     if (breakdown.length === 0) {
       els.chartEmpty.hidden = false;
       return;
@@ -356,21 +452,52 @@ const UI = (() => {
     els.chartEmpty.hidden = true;
     const max = breakdown[0].amount || 1;
     breakdown.forEach(({ category, amount }) => {
-      const row = document.createElement('div');
-      row.className = 'chart-row';
       const pct = Math.max(4, Math.round((amount / max) * 100));
-      row.innerHTML = `
-        <div class="chart-label">
-          <span class="chart-icon">${CATEGORY_ICON[category] || '🗂️'}</span>
-          <span class="chart-name">${category}</span>
-        </div>
-        <div class="chart-track">
-          <div class="chart-fill" style="width:${pct}%"></div>
-        </div>
-        <div class="chart-amount">${formatMoney(amount)}</div>
-      `;
+
+      const label = el('div', 'chart-label');
+      label.append(el('span', 'chart-icon', iconFor(category)), el('span', 'chart-name', category));
+
+      const track = el('div', 'chart-track');
+      const fill = el('div', 'chart-fill');
+      fill.style.width = `${pct}%`;
+      track.appendChild(fill);
+
+      const row = el('div', 'chart-row');
+      row.append(label, track, el('div', 'chart-amount', formatMoney(amount)));
       els.chart.appendChild(row);
     });
+  }
+
+  function buildTransactionRow(t) {
+    const isIncome = t.type === 'income';
+
+    const catText = el('div', 'txn-cat-text');
+    catText.appendChild(el('span', 'cat-name', t.category));
+    if (t.description) catText.appendChild(el('span', 'txn-desc', t.description));
+    const catCell = el('div', 'txn-cell txn-cat');
+    catCell.append(el('span', 'cat-icon', iconFor(t.category)), catText);
+
+    const typeCell = el('div', 'txn-cell txn-type');
+    typeCell.appendChild(el('span', `pill ${isIncome ? 'pill-income' : 'pill-expense'}`, isIncome ? 'Income' : 'Expense'));
+
+    const amountCell = el(
+      'div',
+      `txn-cell txn-amount ${isIncome ? 'positive' : 'negative'}`,
+      `${isIncome ? '+' : '−'}${formatMoney(t.amount)}`
+    );
+
+    const delBtn = el('button', 'icon-btn delete-btn', '🗑️');
+    delBtn.type = 'button';
+    delBtn.title = 'Delete transaction';
+    delBtn.setAttribute('aria-label', 'Delete transaction');
+    delBtn.dataset.id = t.id;
+    const actionsCell = el('div', 'txn-cell txn-actions');
+    actionsCell.appendChild(delBtn);
+
+    const row = el('div', 'txn-row');
+    row.dataset.id = t.id;
+    row.append(catCell, el('div', 'txn-cell txn-date', formatDate(t.date)), typeCell, amountCell, actionsCell);
+    return row;
   }
 
   function renderTransactions() {
@@ -378,39 +505,12 @@ const UI = (() => {
     els.txCount.textContent = all.length === 1 ? '1 transaction' : `${all.length} transactions`;
 
     if (all.length === 0) {
-      els.txList.innerHTML = '';
+      els.txList.replaceChildren();
       els.txEmpty.hidden = false;
       return;
     }
     els.txEmpty.hidden = true;
-
-    els.txList.innerHTML = all.map(t => `
-      <div class="txn-row" data-id="${t.id}">
-        <div class="txn-cell txn-cat">
-          <span class="cat-icon">${CATEGORY_ICON[t.category] || '🗂️'}</span>
-          <div class="txn-cat-text">
-            <span class="cat-name">${escapeHtml(t.category)}</span>
-            ${t.description ? `<span class="txn-desc">${escapeHtml(t.description)}</span>` : ''}
-          </div>
-        </div>
-        <div class="txn-cell txn-date">${formatDate(t.date)}</div>
-        <div class="txn-cell txn-type">
-          <span class="pill pill-${t.type}">${t.type === 'income' ? 'Income' : 'Expense'}</span>
-        </div>
-        <div class="txn-cell txn-amount ${t.type === 'income' ? 'positive' : 'negative'}">
-          ${t.type === 'income' ? '+' : '−'}${formatMoney(t.amount)}
-        </div>
-        <div class="txn-cell txn-actions">
-          <button class="icon-btn delete-btn" title="Delete transaction" aria-label="Delete transaction" data-id="${t.id}">🗑️</button>
-        </div>
-      </div>
-    `).join('');
-  }
-
-  function escapeHtml(str) {
-    const div = document.createElement('div');
-    div.textContent = str;
-    return div.innerHTML;
+    els.txList.replaceChildren(...all.map(buildTransactionRow));
   }
 
   function refreshAll() {
@@ -423,7 +523,7 @@ const UI = (() => {
     const errors = {};
     const warnings = {};
 
-    if (!type || (type !== 'income' && type !== 'expense')) {
+    if (!TYPES.includes(type)) {
       errors.type = 'Select a transaction type.';
     }
 
@@ -431,23 +531,23 @@ const UI = (() => {
       errors.amount = 'Amount is required.';
     } else {
       const num = Number(amount);
-      if (Number.isNaN(num)) errors.amount = 'Enter a valid number.';
+      if (!Number.isFinite(num)) errors.amount = 'Enter a valid number.';
       else if (num <= 0) errors.amount = 'Amount must be greater than 0.';
+      else if (num > 1000000) errors.amount = 'Amount must be at most 1,000,000.';
     }
 
     if (!category) {
       errors.category = 'Choose a category.';
-    } else if (!CATEGORIES.some(c => c.name === category)) {
+    } else if (!CATEGORY_ICON.has(category)) {
       errors.category = 'Choose a valid category.';
     }
 
     if (!date) {
       errors.date = 'Date is required.';
-    } else if (Number.isNaN(new Date(date).getTime())) {
+    } else if (!ISO_DATE_RE.test(date) || Number.isNaN(new Date(date).getTime())) {
       errors.date = 'Enter a valid date.';
-    } else {
-      const today = todayISO();
-      if (date > today) warnings.date = 'This date is in the future.';
+    } else if (date > todayISO()) {
+      warnings.date = 'This date is in the future.';
     }
 
     if (description && description.length > 200) {
@@ -458,6 +558,14 @@ const UI = (() => {
   }
 
   function bindEvents() {
+    els.signinBtn.addEventListener('click', () => {
+      Auth.login().catch(err => {
+        console.error(err);
+        showToast('Could not start sign-in.', { type: 'error' });
+      });
+    });
+    els.signoutBtn.addEventListener('click', () => Auth.logout());
+
     els.typeToggle.querySelectorAll('.seg-btn').forEach(btn => {
       btn.addEventListener('click', () => setActiveType(btn.dataset.type));
     });
@@ -512,8 +620,7 @@ const UI = (() => {
           { type: 'success' }
         );
       } catch (err) {
-        console.error(err);
-        showToast('Could not save transaction. Check your connection and try again.', { type: 'error' });
+        handleApiError(err, 'Could not save transaction. Check your connection and try again.');
       } finally {
         submitBtn.disabled = false;
         submitBtn.textContent = 'Add Transaction';
@@ -528,7 +635,7 @@ const UI = (() => {
       els.budgetInput.classList.remove('has-error');
 
       const num = Number(raw);
-      if (raw === '' || Number.isNaN(num) || num < 0) {
+      if (raw === '' || !Number.isFinite(num) || num < 0) {
         if (errEl) errEl.textContent = 'Enter a valid budget amount (0 or more).';
         els.budgetInput.classList.add('has-error');
         showToast('Please enter a valid budget.', { type: 'error' });
@@ -544,8 +651,7 @@ const UI = (() => {
         refreshAll();
         showToast('Monthly budget saved.', { type: 'success' });
       } catch (err) {
-        console.error(err);
-        showToast('Could not save budget. Check your connection and try again.', { type: 'error' });
+        handleApiError(err, 'Could not save budget. Check your connection and try again.');
       } finally {
         submitBtn.disabled = false;
         submitBtn.textContent = 'Save Budget';
@@ -571,25 +677,31 @@ const UI = (() => {
           type: 'info',
           actionLabel: 'Undo',
           onAction: async () => {
-            if (lastDeleted) {
-              try {
-                await Transactions.restoreTransaction(lastDeleted);
-                lastDeleted = null;
-                refreshAll();
-                showToast('Transaction restored.', { type: 'success' });
-              } catch (err) {
-                console.error(err);
-                showToast('Could not restore transaction.', { type: 'error' });
-              }
+            if (!lastDeleted) return;
+            try {
+              await Transactions.restoreTransaction(lastDeleted);
+              lastDeleted = null;
+              refreshAll();
+              showToast('Transaction restored.', { type: 'success' });
+            } catch (err) {
+              handleApiError(err, 'Could not restore transaction.');
             }
           },
         });
       } catch (err) {
-        console.error(err);
-        showToast('Could not delete transaction. Check your connection and try again.', { type: 'error' });
+        handleApiError(err, 'Could not delete transaction. Check your connection and try again.');
         btn.disabled = false;
       }
     });
+  }
+
+  async function loadData() {
+    els.txEmpty.hidden = true;
+    els.txList.replaceChildren(el('p', 'empty-note', 'Loading your transactions…'));
+
+    const [budget] = await Promise.all([Storage.loadBudget(), Transactions.init()]);
+    currentBudget = { monthlyLimit: typeof budget?.monthlyLimit === 'number' ? budget.monthlyLimit : 0 };
+    refreshAll();
   }
 
   async function init() {
@@ -599,20 +711,34 @@ const UI = (() => {
     els.date.value = todayISO();
     bindEvents();
 
-    els.txEmpty.hidden = true;
-    els.txList.innerHTML = '<p class="empty-note">Loading your transactions…</p>';
+    if (!Auth.isConfigured()) {
+      showGate(
+        'Setup required',
+        'This deployment is not connected to its secure backend yet. An administrator needs to fill in config.js (see aws/README.md).',
+        { showSignIn: false }
+      );
+      return;
+    }
 
     try {
-      const [budget] = await Promise.all([Storage.loadBudget(), Transactions.init()]);
-      currentBudget = budget;
-      refreshAll();
+      await Auth.handleRedirect();
     } catch (err) {
       console.error(err);
-      els.txList.innerHTML = '';
-      showToast('Could not load your data from the server. Check your connection and API URL.', {
-        type: 'error',
-        duration: 8000,
-      });
+      showSignedOut(err.message);
+      return;
+    }
+
+    if (!Auth.isSignedIn()) {
+      showSignedOut();
+      return;
+    }
+
+    showApp();
+    try {
+      await loadData();
+    } catch (err) {
+      els.txList.replaceChildren();
+      handleApiError(err, 'Could not load your data from the server. Check your connection and try again.');
     }
   }
 

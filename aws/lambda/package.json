@@ -1,0 +1,17 @@
+{
+  "name": "smm-api",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Student Money Manager API (AWS Lambda, Node.js 24)",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "test": "node --test \"test/*.test.mjs\""
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "3.1161.0",
+    "@aws-sdk/lib-dynamodb": "3.1161.0"
+  }
+}

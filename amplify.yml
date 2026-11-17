@@ -5,8 +5,11 @@ frontend:
       commands: []
   artifacts:
     baseDirectory: /
+    # Only the public frontend is published. Never add aws/, docs, or config files here (checklist.md §7).
     files:
       - index.html
+      - config.js
+      - auth.js
       - app.js
       - style.css
   cache:

@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  security-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install Lambda dependencies (lockfile)
+        working-directory: aws/lambda
+        run: npm ci
+
+      - name: Lambda unit tests (validation, auth scoping, CORS)
+        working-directory: aws/lambda
+        run: npm test
+
+      - name: Dependency audit (checklist §10)
+        working-directory: aws/lambda
+        run: npm audit --audit-level=high
+
+      - name: Frontend XSS guard (checklist §3)
+        run: |
+          if grep -nE '(innerHTML|outerHTML|insertAdjacentHTML|document\.write)' app.js auth.js config.js; then
+            echo "::error::HTML-string DOM APIs are not allowed in the frontend. Use createElement/textContent."
+            exit 1
+          fi
+          if grep -nE '\beval\(|new Function\(' app.js auth.js config.js; then
+            echo "::error::eval/new Function are not allowed."
+            exit 1
+          fi
+
+      - name: Wildcard CORS guard (checklist §6)
+        run: |
+          if grep -nE "Allow-Origin\"?: *\"?\*" -r aws/lambda/*.mjs aws/template.yaml; then
+            echo "::error::Wildcard CORS is not allowed."
+            exit 1
+          fi
+
+      - name: Broad IAM policy guard (checklist §2)
+        run: |
+          if grep -nE 'PowerUserAccess|AdministratorAccess|FullAccess|"\*"\s*$|Action:\s*"?\*' aws/template.yaml; then
+            echo "::error::Broad IAM permissions are not allowed."
+            exit 1
+          fi
+
+      - name: Publish list guard (checklist §7)
+        run: |
+          if grep -nE '^\s*-\s*(aws|\.git|CLAUDE|checklist|\*\*)' amplify.yml; then
+            echo "::error::amplify.yml must publish only the public frontend files."
+            exit 1
+          fi

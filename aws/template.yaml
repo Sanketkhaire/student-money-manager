@@ -1,0 +1,459 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Student Money Manager - secured backend (Cognito auth, JWT-protected HTTP API,
+  least-privilege Lambda, per-user DynamoDB tables with PITR, throttling, logging,
+  alarms, budget alert, GitHub OIDC deploy role). See aws/README.md and checklist.md.
+
+Parameters:
+  AppOrigin:
+    Type: String
+    Description: Exact origin of the Amplify site, no trailing slash (e.g. https://master.d1abc23.amplifyapp.com)
+    AllowedPattern: "^https://[a-z0-9.-]+$"
+  DevOrigin:
+    Type: String
+    Default: ""
+    Description: Optional local dev origin (e.g. http://localhost:8080). Leave empty in production.
+  CognitoDomainPrefix:
+    Type: String
+    Description: Globally unique prefix for the Cognito sign-in domain (lowercase letters, digits, hyphens)
+    AllowedPattern: "^[a-z0-9-]{3,63}$"
+  AlertEmail:
+    Type: String
+    Default: ""
+    Description: Email for CloudWatch alarm and AWS Budget notifications (recommended)
+  MonthlyBudgetUSD:
+    Type: Number
+    Default: 1
+    Description: Alert when monthly AWS spend passes 80% of this amount
+  GitHubRepo:
+    Type: String
+    Default: Sanketkhaire/student-money-manager
+    Description: owner/repo allowed to deploy the Lambda via GitHub Actions OIDC
+  CreateGitHubOidcProvider:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+    Description: Set to false if the account already has the token.actions.githubusercontent.com OIDC provider
+  LambdaReservedConcurrency:
+    Type: Number
+    Default: 0
+    Description: Reserved concurrency for the API Lambda (0 = don't set; new accounts with a 10-concurrency limit must use 0)
+
+Conditions:
+  HasDevOrigin: !Not [!Equals [!Ref DevOrigin, ""]]
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+  CreateOidc: !Equals [!Ref CreateGitHubOidcProvider, "true"]
+  HasReservedConcurrency: !Not [!Equals [!Ref LambdaReservedConcurrency, 0]]
+
+Resources:
+  # ---------------------------------------------------------------- Data (§1, §8)
+  TransactionsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: SMM_UserTransactions
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: userId, AttributeType: S }
+        - { AttributeName: id, AttributeType: S }
+      KeySchema:
+        - { AttributeName: userId, KeyType: HASH }
+        - { AttributeName: id, KeyType: RANGE }
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      DeletionProtectionEnabled: true
+
+  BudgetTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: SMM_UserBudget
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: userId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: userId, KeyType: HASH }
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      DeletionProtectionEnabled: true
+
+  # ---------------------------------------------------------------- Auth (§1)
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      UserPoolName: smm-users
+      UserPoolTier: LITE
+      DeletionProtection: ACTIVE
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - { Name: verified_email, Priority: 1 }
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: false
+      MfaConfiguration: OPTIONAL
+      EnabledMfas: [SOFTWARE_TOKEN_MFA]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 10
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+          TemporaryPasswordValidityDays: 3
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Ref CognitoDomainPrefix
+      UserPoolId: !Ref UserPool
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: smm-web
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [openid, email]
+      SupportedIdentityProviders: [COGNITO]
+      CallbackURLs: !If
+        - HasDevOrigin
+        - [!Sub "${AppOrigin}/", !Sub "${DevOrigin}/"]
+        - [!Sub "${AppOrigin}/"]
+      LogoutURLs: !If
+        - HasDevOrigin
+        - [!Sub "${AppOrigin}/", !Sub "${DevOrigin}/"]
+        - [!Sub "${AppOrigin}/"]
+      ExplicitAuthFlows: [ALLOW_REFRESH_TOKEN_AUTH]
+      PreventUserExistenceErrors: ENABLED
+      EnableTokenRevocation: true
+      AccessTokenValidity: 1
+      IdTokenValidity: 1
+      RefreshTokenValidity: 1
+      TokenValidityUnits:
+        AccessToken: hours
+        IdToken: hours
+        RefreshToken: days
+
+  # ---------------------------------------------------------------- Lambda (§2)
+  ApiFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/smm-api-secure
+      RetentionInDays: 30
+
+  ApiFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: smm-api-secure-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: smm-api-least-privilege
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: TransactionsTable
+                Effect: Allow
+                Action: [dynamodb:Query, dynamodb:PutItem, dynamodb:DeleteItem]
+                Resource: !GetAtt TransactionsTable.Arn
+              - Sid: BudgetTable
+                Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem]
+                Resource: !GetAtt BudgetTable.Arn
+              - Sid: Logs
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "${ApiFunctionLogGroup.Arn}:*"
+
+  ApiFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: smm-api-secure
+      Runtime: nodejs24.x
+      Handler: index.handler
+      MemorySize: 128
+      Timeout: 5
+      Role: !GetAtt ApiFunctionRole.Arn
+      ReservedConcurrentExecutions: !If [HasReservedConcurrency, !Ref LambdaReservedConcurrency, !Ref AWS::NoValue]
+      LoggingConfig:
+        LogGroup: !Ref ApiFunctionLogGroup
+        LogFormat: Text
+      Environment:
+        Variables:
+          TRANSACTIONS_TABLE: !Ref TransactionsTable
+          BUDGET_TABLE: !Ref BudgetTable
+          ALLOWED_ORIGIN: !Ref AppOrigin
+      Code:
+        # Placeholder. The real code (aws/lambda) is deployed by .github/workflows/deploy-lambda.yml.
+        ZipFile: |
+          exports.handler = async () => ({
+            statusCode: 503,
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ message: "API code not deployed yet. Run the 'Deploy Lambda' GitHub workflow." })
+          });
+
+  # ---------------------------------------------------------------- HTTP API (§1, §5, §6, §8)
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: smm-api-secure
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins: !If [HasDevOrigin, [!Ref AppOrigin, !Ref DevOrigin], [!Ref AppOrigin]]
+        AllowMethods: [GET, POST, PUT, DELETE]
+        AllowHeaders: [authorization, content-type]
+        MaxAge: 600
+
+  JwtAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref HttpApi
+      Name: cognito-jwt
+      AuthorizerType: JWT
+      IdentitySource: ["$request.header.Authorization"]
+      JwtConfiguration:
+        Issuer: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}"
+        Audience: [!Ref UserPoolClient]
+
+  LambdaIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt ApiFunction.Arn
+      PayloadFormatVersion: "2.0"
+
+  RouteListTransactions:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: GET /transactions
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub "integrations/${LambdaIntegration}"
+
+  RouteCreateTransaction:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: POST /transactions
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub "integrations/${LambdaIntegration}"
+
+  RouteDeleteTransaction:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: DELETE /transactions/{id}
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub "integrations/${LambdaIntegration}"
+
+  RouteGetBudget:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: GET /budget
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub "integrations/${LambdaIntegration}"
+
+  RoutePutBudget:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: PUT /budget
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub "integrations/${LambdaIntegration}"
+
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/apigateway/smm-api-secure
+      RetentionInDays: 30
+
+  ApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: $default
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingRateLimit: 10
+        ThrottlingBurstLimit: 20
+      AccessLogSettings:
+        DestinationArn: !GetAtt ApiAccessLogGroup.Arn
+        Format: '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","requestTime":"$context.requestTime","routeKey":"$context.routeKey","status":"$context.status","responseLength":"$context.responseLength","userSub":"$context.authorizer.claims.sub","authError":"$context.authorizer.error","integrationError":"$context.integrationErrorMessage"}'
+
+  ApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ApiFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*"
+
+  # ---------------------------------------------------------------- Monitoring (§5, §8)
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasAlertEmail
+    Properties:
+      TopicName: smm-alerts
+      Subscription:
+        - { Protocol: email, Endpoint: !Ref AlertEmail }
+
+  LambdaErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: smm-api-lambda-errors
+      AlarmDescription: The API Lambda threw unhandled errors.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{ Name: FunctionName, Value: !Ref ApiFunction }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlertEmail, [!Ref AlertTopic], !Ref AWS::NoValue]
+
+  LambdaThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: smm-api-lambda-throttles
+      AlarmDescription: The API Lambda is being throttled (possible abuse or traffic spike).
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions: [{ Name: FunctionName, Value: !Ref ApiFunction }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlertEmail, [!Ref AlertTopic], !Ref AWS::NoValue]
+
+  Api5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: smm-api-5xx
+      AlarmDescription: The API returned server errors.
+      Namespace: AWS/ApiGateway
+      MetricName: 5xx
+      Dimensions: [{ Name: ApiId, Value: !Ref HttpApi }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlertEmail, [!Ref AlertTopic], !Ref AWS::NoValue]
+
+  Api4xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: smm-api-4xx-spike
+      AlarmDescription: Unusual number of rejected requests (auth failures, probing, throttling).
+      Namespace: AWS/ApiGateway
+      MetricName: 4xx
+      Dimensions: [{ Name: ApiId, Value: !Ref HttpApi }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 100
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlertEmail, [!Ref AlertTopic], !Ref AWS::NoValue]
+
+  CostBudget:
+    Type: AWS::Budgets::Budget
+    Condition: HasAlertEmail
+    Properties:
+      Budget:
+        BudgetName: smm-monthly-cost
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit: { Amount: !Ref MonthlyBudgetUSD, Unit: USD }
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 80
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - { SubscriptionType: EMAIL, Address: !Ref AlertEmail }
+
+  # ---------------------------------------------------------------- CI/CD deploy role (§10)
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: CreateOidc
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList: [sts.amazonaws.com]
+      ThumbprintList:
+        - 6938fd4d98bab03faadb97b34396831e3780aea1
+        - 1c58a3a8518e8759bf075b76b750d4f2df264fcd
+
+  GitHubDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: smm-github-deploy
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If
+                - CreateOidc
+                - !Ref GitHubOidcProvider
+                - !Sub "arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com"
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                "token.actions.githubusercontent.com:aud": sts.amazonaws.com
+                "token.actions.githubusercontent.com:sub": !Sub "repo:${GitHubRepo}:ref:refs/heads/master"
+      Policies:
+        - PolicyName: deploy-api-lambda-only
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [lambda:UpdateFunctionCode, lambda:GetFunction, lambda:GetFunctionConfiguration]
+                Resource: !GetAtt ApiFunction.Arn
+
+Outputs:
+  ApiUrl:
+    Description: "config.js -> apiBaseUrl"
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+  CognitoDomain:
+    Description: "config.js -> cognitoDomain"
+    Value: !Sub "https://${CognitoDomainPrefix}.auth.${AWS::Region}.amazoncognito.com"
+  UserPoolClientId:
+    Description: "config.js -> cognitoClientId"
+    Value: !Ref UserPoolClient
+  UserPoolId:
+    Value: !Ref UserPool
+  LambdaFunctionName:
+    Description: "GitHub repo variable LAMBDA_FUNCTION_NAME"
+    Value: !Ref ApiFunction
+  GitHubDeployRoleArn:
+    Description: "GitHub repo variable AWS_DEPLOY_ROLE_ARN"
+    Value: !GetAtt GitHubDeployRole.Arn
